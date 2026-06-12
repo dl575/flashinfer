@@ -571,7 +571,7 @@ def _test_decode_kernel_pretranspose_pool(
     )
 
 
-@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
@@ -2180,7 +2180,7 @@ if __name__ == "__main__":
 # ============================================================================
 
 
-@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 def test_output_state_indices(batch_size: int, state_dtype: str):
     """Test that output_state_indices writes to different pool slots than read."""
@@ -2284,7 +2284,7 @@ def test_output_state_indices(batch_size: int, state_dtype: str):
     )
 
 
-@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
     """output_state_indices == initial_state_indices must match existing pool behavior."""

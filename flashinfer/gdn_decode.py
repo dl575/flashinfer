@@ -143,6 +143,9 @@ def gated_delta_rule_decode_pretranspose(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
+    use_sr: bool = False,
+    philox_rounds: int = 10,
+    rand_seed: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -322,6 +325,9 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
             )
         else:
             # MTP kernel for T>1 (supports pool+indices and intermediate caching)
@@ -341,6 +347,9 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
             )
         if forward_output is not None:
             # Kernel wrote directly into the user's buffer.
@@ -393,6 +402,9 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
             )
         else:
             out = _gated_delta_rule_fp16_state_mtp(
@@ -411,6 +423,9 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
             )
         if forward_output is not None:
             output = forward_output

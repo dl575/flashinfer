@@ -2133,7 +2133,14 @@ def gated_delta_rule_mtp_wide_vec(
     # IS_BF16 describes the IO (q/k/v) dtype; IS_FP8 the state pool. For fp8
     # state the IO is still bf16/fp16, so derive IS_BF16 from q, not the state.
     is_fp8 = initial_state_source.dtype == torch.float8_e4m3fn
-    is_bf16 = q.dtype == torch.bfloat16
+    # IS_BF16 = IO dtype. For bf16/fp16 state, IO matches the state pool (the
+    # original contract). For fp8 state, IO is independent (q/k/v stay bf16/
+    # fp16), so derive it from q.
+    is_bf16 = (
+        (q.dtype == torch.bfloat16)
+        if is_fp8
+        else (initial_state_source.dtype == torch.bfloat16)
+    )
     h0_scale_source = _resolve_scale_pool(state_scale, is_fp8, q.device)
     cache_key = (
         "v3_mtp_narrow_tiled",
@@ -2424,7 +2431,14 @@ def gated_delta_rule_mtp(
     pool_slot_stride = int(initial_state_source.stride(0))
     # IS_BF16 = IO (q/k/v) dtype; IS_FP8 = state pool dtype (see wide_vec note).
     is_fp8 = initial_state_source.dtype == torch.float8_e4m3fn
-    is_bf16 = q.dtype == torch.bfloat16
+    # IS_BF16 = IO dtype. For bf16/fp16 state, IO matches the state pool (the
+    # original contract). For fp8 state, IO is independent (q/k/v stay bf16/
+    # fp16), so derive it from q.
+    is_bf16 = (
+        (q.dtype == torch.bfloat16)
+        if is_fp8
+        else (initial_state_source.dtype == torch.bfloat16)
+    )
     h0_scale_source = _resolve_scale_pool(state_scale, is_fp8, q.device)
     cache_key = (
         "mtp_narrow",

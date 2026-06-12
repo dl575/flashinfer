@@ -128,6 +128,23 @@ def _resolve_rand_seed(rand_seed, use_sr, device):
     return torch.zeros(2, dtype=torch.int32, device=device)
 
 
+def _resolve_scale_pool(state_scale, is_fp8, device):
+    """Return a valid fp32 per-row scale pool tensor.
+
+    fp8 state requires a stateful ``[pool, HV, V]`` scale pool (read on load,
+    written on store) — the caller must provide it. For bf16/fp16 the kernel
+    never touches it, so a 1-element dummy is enough to satisfy the signature.
+    """
+    if state_scale is not None:
+        return state_scale
+    if is_fp8:
+        raise ValueError(
+            "fp8 GDN state requires `state_scale` (the per-row [pool, HV, V] "
+            "fp32 scale pool); none was provided."
+        )
+    return torch.zeros(1, dtype=torch.float32, device=device)
+
+
 # ==============================================================================
 # Stochastic rounding: Philox-4x32 RNG + hardware cvt.rs (SM100+ Blackwell)
 # ==============================================================================
@@ -338,6 +355,8 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
+    h0_scale_source: cute.Tensor,
+    IS_FP8: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -428,16 +447,16 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
         cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb4_0 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
     r_hb4_1 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
     r_hb4_2 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
     r_hb4_3 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
     r_o4_bf16 = cute.make_rmem_tensor(
         cute.make_layout((ILP4,), stride=(1,)), _narrow_dtype(IS_BF16)
@@ -983,6 +1002,8 @@ def gdn_wide_vec_kernel(
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
+    h0_scale_source: cute.Tensor,
+    IS_FP8: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -1057,16 +1078,16 @@ def gdn_wide_vec_kernel(
         cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb0 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
     r_hb1 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
     r_hb2 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
     r_hb3 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
     )
 
     if cache_idx < 0:
@@ -1500,6 +1521,8 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
+    h0_scale_source: cute.Tensor,
+    IS_FP8: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -1554,6 +1577,8 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         rand_seed,
         USE_SR,
         PHILOX_ROUNDS,
+        h0_scale_source,
+        IS_FP8,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -1600,6 +1625,8 @@ def _run_wide_vec(
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
+    h0_scale_source: cute.Tensor,
+    IS_FP8: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
@@ -1643,6 +1670,8 @@ def _run_wide_vec(
         rand_seed,
         USE_SR,
         PHILOX_ROUNDS,
+        h0_scale_source,
+        IS_FP8,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -1675,6 +1704,7 @@ def gated_delta_rule(
     use_sr: bool = False,
     philox_rounds: int = 10,
     rand_seed: Optional[torch.Tensor] = None,
+    state_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     GDN decode T=1 with BF16 state (pool mode, K=V=128 only).
@@ -1715,7 +1745,7 @@ def gated_delta_rule(
     HV = v.shape[2]
     V = v.shape[3]
     assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
-    assert initial_state_source.dtype in (torch.bfloat16, torch.float16)
+    assert initial_state_source.dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
     assert initial_state_indices is not None, (
         "Pool mode is required: pass initial_state_indices. "
         "Non-pool mode is no longer supported by the BF16 GDN kernels."
@@ -1763,6 +1793,7 @@ def gated_delta_rule(
             use_sr=use_sr,
             philox_rounds=philox_rounds,
             rand_seed=rand_seed,
+            state_scale=state_scale,
         )
 
     # Wide_vec didn't fire (B*HV too small at T=1, i.e. tile_v < 64).
@@ -1787,6 +1818,7 @@ def gated_delta_rule(
         use_sr=use_sr,
         philox_rounds=philox_rounds,
         rand_seed=rand_seed,
+        state_scale=state_scale,
     )
 
 
@@ -1906,6 +1938,7 @@ def gated_delta_rule_mtp_wide_vec(
     use_sr: bool = False,
     philox_rounds: int = 10,
     rand_seed: Optional[torch.Tensor] = None,
+    state_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Wide-vector BF16 GDN MTP decode.
 
@@ -1936,7 +1969,7 @@ def gated_delta_rule_mtp_wide_vec(
     V_val = v.shape[3]
     pool_size = initial_state_source.shape[0]
     assert K_val == 128 and V_val == 128
-    assert initial_state_source.dtype in (torch.bfloat16, torch.float16)
+    assert initial_state_source.dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
     assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
     assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
         f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
@@ -1992,7 +2025,11 @@ def gated_delta_rule_mtp_wide_vec(
     # page). Include in the cache key so padded vs tight pools each get their
     # own compiled kernel — cute.compile bakes the stride into the cubin.
     pool_slot_stride = int(initial_state_source.stride(0))
-    is_bf16 = initial_state_source.dtype == torch.bfloat16
+    # IS_BF16 describes the IO (q/k/v) dtype; IS_FP8 the state pool. For fp8
+    # state the IO is still bf16/fp16, so derive IS_BF16 from q, not the state.
+    is_fp8 = initial_state_source.dtype == torch.float8_e4m3fn
+    is_bf16 = q.dtype == torch.bfloat16
+    h0_scale_source = _resolve_scale_pool(state_scale, is_fp8, q.device)
     cache_key = (
         "v3_mtp_narrow_tiled",
         B_val,
@@ -2015,6 +2052,7 @@ def gated_delta_rule_mtp_wide_vec(
         is_bf16,
         use_sr,
         philox_rounds,
+        is_fp8,
     )
     if cache_key not in _compiled_kernels_wide_vec:
         default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
@@ -2047,6 +2085,9 @@ def gated_delta_rule_mtp_wide_vec(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
         )
         rand_seed_ = from_dlpack(rand_seed, assumed_align=32, enable_tvm_ffi=True)
+        scale_source_ = from_dlpack(
+            h0_scale_source, assumed_align=32, enable_tvm_ffi=True
+        )
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -2082,6 +2123,8 @@ def gated_delta_rule_mtp_wide_vec(
                 rand_seed_,
                 use_sr,
                 philox_rounds,
+                scale_source_,
+                is_fp8,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -2113,6 +2156,7 @@ def gated_delta_rule_mtp_wide_vec(
         initial_state_indices,
         output_state_indices,
         rand_seed,
+        h0_scale_source,
         stream,
     )
     return output
@@ -2139,6 +2183,7 @@ def gated_delta_rule_mtp(
     use_sr: bool = False,
     philox_rounds: int = 10,
     rand_seed: Optional[torch.Tensor] = None,
+    state_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     GDN MTP (Multiple Token Processing) with BF16 state.
@@ -2181,7 +2226,7 @@ def gated_delta_rule_mtp(
     V = v.shape[3]
     pool_size = initial_state_source.shape[0]
     assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
-    assert initial_state_source.dtype in (torch.bfloat16, torch.float16)
+    assert initial_state_source.dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
     assert initial_state_indices is not None, (
         "Pool mode is required: pass initial_state_indices. "
         "Non-pool mode is no longer supported by the BF16 GDN MTP kernels."
@@ -2272,7 +2317,10 @@ def gated_delta_rule_mtp(
     # Slot stride may be larger than HV*V*K (vLLM's packed conv+ssm page).
     # Include in cache key — cute.compile bakes the stride into the cubin.
     pool_slot_stride = int(initial_state_source.stride(0))
-    is_bf16 = initial_state_source.dtype == torch.bfloat16
+    # IS_BF16 = IO (q/k/v) dtype; IS_FP8 = state pool dtype (see wide_vec note).
+    is_fp8 = initial_state_source.dtype == torch.float8_e4m3fn
+    is_bf16 = q.dtype == torch.bfloat16
+    h0_scale_source = _resolve_scale_pool(state_scale, is_fp8, q.device)
     cache_key = (
         "mtp_narrow",
         B,
@@ -2296,6 +2344,7 @@ def gated_delta_rule_mtp(
         is_bf16,
         use_sr,
         philox_rounds,
+        is_fp8,
     )
     if cache_key not in _compiled_kernels_mtp:
         # First call for this shape: allocate default indices/output and do
@@ -2321,6 +2370,9 @@ def gated_delta_rule_mtp(
             default_indices, assumed_align=32, enable_tvm_ffi=True
         )
         rand_seed_ = from_dlpack(rand_seed, assumed_align=32, enable_tvm_ffi=True)
+        scale_source_ = from_dlpack(
+            h0_scale_source, assumed_align=32, enable_tvm_ffi=True
+        )
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -2356,6 +2408,8 @@ def gated_delta_rule_mtp(
                 rand_seed_,
                 use_sr,
                 philox_rounds,
+                scale_source_,
+                is_fp8,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -2384,6 +2438,7 @@ def gated_delta_rule_mtp(
         initial_state_indices,
         output_state_indices,
         rand_seed,
+        h0_scale_source,
         stream,
     )
 

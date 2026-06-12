@@ -600,11 +600,24 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             cute.autovec_copy(htc, r_hb4_2)
             cute.autovec_copy(htd, r_hb4_3)
 
-            for i in cutlass.range_constexpr(vec_size):
-                r_h[0, i] = cutlass.Float32(r_hb4_0[i])
-                r_h[1, i] = cutlass.Float32(r_hb4_1[i])
-                r_h[2, i] = cutlass.Float32(r_hb4_2[i])
-                r_h[3, i] = cutlass.Float32(r_hb4_3[i])
+            # fp8 state is dequantized on load: r_h = fp8 * per-row scale. The
+            # scale pool is [pool, HV, V] fp32, indexed by the read slot.
+            if cutlass.const_expr(IS_FP8):
+                sa = h0_scale_source[(cache_idx, i_hv, va)].to(cutlass.Float32)
+                sb = h0_scale_source[(cache_idx, i_hv, vb)].to(cutlass.Float32)
+                sc = h0_scale_source[(cache_idx, i_hv, vc)].to(cutlass.Float32)
+                sd = h0_scale_source[(cache_idx, i_hv, vd)].to(cutlass.Float32)
+                for i in cutlass.range_constexpr(vec_size):
+                    r_h[0, i] = cutlass.Float32(r_hb4_0[i]) * sa
+                    r_h[1, i] = cutlass.Float32(r_hb4_1[i]) * sb
+                    r_h[2, i] = cutlass.Float32(r_hb4_2[i]) * sc
+                    r_h[3, i] = cutlass.Float32(r_hb4_3[i]) * sd
+            else:
+                for i in cutlass.range_constexpr(vec_size):
+                    r_h[0, i] = cutlass.Float32(r_hb4_0[i])
+                    r_h[1, i] = cutlass.Float32(r_hb4_1[i])
+                    r_h[2, i] = cutlass.Float32(r_hb4_2[i])
+                    r_h[3, i] = cutlass.Float32(r_hb4_3[i])
 
             for i_t in cutlass.range(T, unroll=1, unroll_full=(T <= 1)):
                 if cutlass.const_expr(T > 1):

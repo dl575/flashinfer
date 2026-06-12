@@ -15,11 +15,11 @@ limitations under the License.
 """
 
 """
-Gated Delta Rule Decode Kernel - BF16 Hidden State
-===================================================
+Gated Delta Rule Decode Kernel - BF16/FP16 Hidden State
+========================================================
 
-CuTe DSL kernels for GDN decode with BF16 hidden state storage. Pool mode
-only (each batch element reads/writes its slot in a shared
+CuTe DSL kernels for GDN decode with narrow (BF16 or FP16) hidden state
+storage. Pool mode only (each batch element reads/writes its slot in a shared
 ``[pool_size, HV, V, K]`` state pool, indexed by ``initial_state_indices``).
 Split-pool writes (``output_state_indices != initial_state_indices``,
 PR #2905) are supported natively by both kernels. ``K = V = 128`` is
@@ -28,6 +28,8 @@ required.
 Public API:
 - ``gated_delta_rule()``: T=1 single-token decode with BF16 state.
 - ``gated_delta_rule_mtp()``: multi-token prediction (T>=1) with BF16 state.
+- ``gated_delta_rule_fp16()``: T=1 single-token decode with FP16 state.
+- ``gated_delta_rule_fp16_mtp()``: multi-token prediction (T>=1) with FP16 state.
 
 Both entries dispatch to one of:
 - ``gdn_wide_vec_kernel`` — the fast path (LDG.E.128 / STG.E.128). Covers
@@ -74,6 +76,24 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
     return result1, result2
 
 
+# ==============================================================================
+# Dtype helpers: bf16/fp16 cast + register allocation via IS_BF16 constexpr
+# ==============================================================================
+
+@cute.jit
+def _to_narrow(val, IS_BF16: cutlass.Constexpr[bool]):
+    """Cast fp32 → narrow state dtype (bf16 or fp16), compile-time dispatched."""
+    if cutlass.const_expr(IS_BF16):
+        return cutlass.BFloat16(val)
+    else:
+        return cutlass.Float16(val)
+
+
+def _narrow_dtype(is_bf16: bool):
+    """Return the cutlass dtype for register allocation."""
+    return cutlass.BFloat16 if is_bf16 else cutlass.Float16
+
+
 MTP_NUM_THREADS = 128
 MTP_VEC_SIZE = 4  # 32 threads per group x 4 = 128 K elements
 
@@ -81,8 +101,8 @@ MTP_VEC_SIZE = 4  # 32 threads per group x 4 = 128 K elements
 # LDG.128 over 16-thread subgroups, 8 subgroups per CTA. tile_v is passed as a
 # constexpr at compile time; the kernel decodes (i_n, i_hv, i_v) from the
 # linear block_idx.
-LANES_PER_ROW = 16  # 16 threads cooperate on one V-row's K=128 BF16
-ELEMS_PER_LANE = 8  # 8 BF16 = LDG.128
+LANES_PER_ROW = 16  # 16 threads cooperate on one V-row's K=128 bf16/fp16
+ELEMS_PER_LANE = 8  # 8 x 16-bit = LDG.128
 NUM_WARPS = 4
 NUM_THREADS = NUM_WARPS * 32  # 128
 NUM_GROUPS = NUM_THREADS // LANES_PER_ROW  # 8 groups of 16 threads
@@ -139,6 +159,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -216,28 +237,28 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
         cutlass.Float32,
     )
     r_q_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_k_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb4_0 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb4_1 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb4_2 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb4_3 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_o4_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((ILP4,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((ILP4,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_v4_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((ILP4,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((ILP4,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
 
     if cache_idx < 0:
@@ -636,10 +657,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
 
                 if cutlass.const_expr(cache_intermediate_states):
                     for i in cutlass.range_constexpr(vec_size):
-                        r_hb4_0[i] = cutlass.BFloat16(r_h[0, i])
-                        r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
-                        r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
-                        r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
+                        r_hb4_0[i] = _to_narrow(r_h[0, i], IS_BF16)
+                        r_hb4_1[i] = _to_narrow(r_h[1, i], IS_BF16)
+                        r_hb4_2[i] = _to_narrow(r_h[2, i], IS_BF16)
+                        r_hb4_3[i] = _to_narrow(r_h[3, i], IS_BF16)
 
                 if cutlass.const_expr(cache_intermediate_states):
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
@@ -699,10 +720,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     )
 
                 if lane_in_group == 0:
-                    r_o4_bf16[0] = cutlass.BFloat16(oa)
-                    r_o4_bf16[1] = cutlass.BFloat16(ob)
-                    r_o4_bf16[2] = cutlass.BFloat16(oc)
-                    r_o4_bf16[3] = cutlass.BFloat16(od)
+                    r_o4_bf16[0] = _to_narrow(oa, IS_BF16)
+                    r_o4_bf16[1] = _to_narrow(ob, IS_BF16)
+                    r_o4_bf16[2] = _to_narrow(oc, IS_BF16)
+                    r_o4_bf16[3] = _to_narrow(od, IS_BF16)
                     ot4_slice = cute.local_tile(
                         o,
                         (1, 1, 1, ILP4),
@@ -713,10 +734,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             if cutlass.const_expr(not disable_state_update):
                 if cutlass.const_expr(not cache_intermediate_states):
                     for i in cutlass.range_constexpr(vec_size):
-                        r_hb4_0[i] = cutlass.BFloat16(r_h[0, i])
-                        r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
-                        r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
-                        r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
+                        r_hb4_0[i] = _to_narrow(r_h[0, i], IS_BF16)
+                        r_hb4_1[i] = _to_narrow(r_h[1, i], IS_BF16)
+                        r_hb4_2[i] = _to_narrow(r_h[2, i], IS_BF16)
+                        r_hb4_3[i] = _to_narrow(r_h[3, i], IS_BF16)
                 cute.autovec_copy(r_hb4_0, hta_w)
                 cute.autovec_copy(r_hb4_1, htb_w)
                 cute.autovec_copy(r_hb4_2, htc_w)
@@ -761,6 +782,7 @@ def gdn_wide_vec_kernel(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -822,22 +844,22 @@ def gdn_wide_vec_kernel(
     r_q = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
     r_q_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_k_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb0 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb1 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb2 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb3 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+        cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
 
     if cache_idx < 0:
@@ -1153,18 +1175,18 @@ def gdn_wide_vec_kernel(
 
                 # Output scalar write (lane_in_group==0 only)
                 if lane_in_group == 0:
-                    o[(i_n, i_t, i_hv, v0)] = cutlass.BFloat16(o0)
-                    o[(i_n, i_t, i_hv, v1)] = cutlass.BFloat16(o1)
-                    o[(i_n, i_t, i_hv, v2)] = cutlass.BFloat16(o2)
-                    o[(i_n, i_t, i_hv, v3)] = cutlass.BFloat16(o3)
+                    o[(i_n, i_t, i_hv, v0)] = _to_narrow(o0, IS_BF16)
+                    o[(i_n, i_t, i_hv, v1)] = _to_narrow(o1, IS_BF16)
+                    o[(i_n, i_t, i_hv, v2)] = _to_narrow(o2, IS_BF16)
+                    o[(i_n, i_t, i_hv, v3)] = _to_narrow(o3, IS_BF16)
 
                 # Intermediate write (for every token when caching)
                 if cutlass.const_expr(cache_intermediate_states):
                     for i in cutlass.range_constexpr(vec):
-                        r_hb0[i] = cutlass.BFloat16(r_h[0, i])
-                        r_hb1[i] = cutlass.BFloat16(r_h[1, i])
-                        r_hb2[i] = cutlass.BFloat16(r_h[2, i])
-                        r_hb3[i] = cutlass.BFloat16(r_h[3, i])
+                        r_hb0[i] = _to_narrow(r_h[0, i], IS_BF16)
+                        r_hb1[i] = _to_narrow(r_h[1, i], IS_BF16)
+                        r_hb2[i] = _to_narrow(r_h[2, i], IS_BF16)
+                        r_hb3[i] = _to_narrow(r_h[3, i], IS_BF16)
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
                     # (the per-call batch index) and not cache_idx (the pool
@@ -1215,10 +1237,10 @@ def gdn_wide_vec_kernel(
                 not disable_state_update and not cache_intermediate_states
             ):
                 for i in cutlass.range_constexpr(vec):
-                    r_hb0[i] = cutlass.BFloat16(r_h[0, i])
-                    r_hb1[i] = cutlass.BFloat16(r_h[1, i])
-                    r_hb2[i] = cutlass.BFloat16(r_h[2, i])
-                    r_hb3[i] = cutlass.BFloat16(r_h[3, i])
+                    r_hb0[i] = _to_narrow(r_h[0, i], IS_BF16)
+                    r_hb1[i] = _to_narrow(r_h[1, i], IS_BF16)
+                    r_hb2[i] = _to_narrow(r_h[2, i], IS_BF16)
+                    r_hb3[i] = _to_narrow(r_h[3, i], IS_BF16)
                 cute.autovec_copy(r_hb0, ht_w0)
                 cute.autovec_copy(r_hb1, ht_w1)
                 cute.autovec_copy(r_hb2, ht_w2)
@@ -1259,6 +1281,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -1309,6 +1332,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         cache_intermediate_states,
         use_packed_fma,
         same_pool,
+        IS_BF16,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -1351,6 +1375,7 @@ def _run_wide_vec(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
@@ -1390,6 +1415,7 @@ def _run_wide_vec(
         cache_intermediate_states,
         use_packed_fma,
         same_pool,
+        IS_BF16,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -1459,7 +1485,7 @@ def gated_delta_rule(
     HV = v.shape[2]
     V = v.shape[3]
     assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
-    assert initial_state_source.dtype == torch.bfloat16
+    assert initial_state_source.dtype in (torch.bfloat16, torch.float16)
     assert initial_state_indices is not None, (
         "Pool mode is required: pass initial_state_indices. "
         "Non-pool mode is no longer supported by the BF16 GDN kernels."
@@ -1669,7 +1695,7 @@ def gated_delta_rule_mtp_wide_vec(
     V_val = v.shape[3]
     pool_size = initial_state_source.shape[0]
     assert K_val == 128 and V_val == 128
-    assert initial_state_source.dtype == torch.bfloat16
+    assert initial_state_source.dtype in (torch.bfloat16, torch.float16)
     assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
     assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
         f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
@@ -1696,7 +1722,7 @@ def gated_delta_rule_mtp_wide_vec(
             f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
         )
         assert cache_steps >= T_val
-        assert intermediate_states_buffer.dtype == torch.bfloat16
+        assert intermediate_states_buffer.dtype in (torch.bfloat16, torch.float16)
         intermediate_states = intermediate_states_buffer.reshape(
             B_val * cache_steps * HV_val, V_val, K_val
         )
@@ -1725,8 +1751,9 @@ def gated_delta_rule_mtp_wide_vec(
     # page). Include in the cache key so padded vs tight pools each get their
     # own compiled kernel — cute.compile bakes the stride into the cubin.
     pool_slot_stride = int(initial_state_source.stride(0))
+    is_bf16 = initial_state_source.dtype == torch.bfloat16
     cache_key = (
-        "v3_mtp_bf16_tiled",
+        "v3_mtp_narrow_tiled",
         B_val,
         T_val,
         H_val,
@@ -1744,6 +1771,7 @@ def gated_delta_rule_mtp_wide_vec(
         softplus_threshold,
         use_packed_fma,
         same_pool,
+        is_bf16,
     )
     if cache_key not in _compiled_kernels_wide_vec:
         default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
@@ -1806,6 +1834,7 @@ def gated_delta_rule_mtp_wide_vec(
                 cache_intermediate_states,
                 use_packed_fma,
                 same_pool,
+                is_bf16,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -1899,7 +1928,7 @@ def gated_delta_rule_mtp(
     V = v.shape[3]
     pool_size = initial_state_source.shape[0]
     assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
-    assert initial_state_source.dtype == torch.bfloat16
+    assert initial_state_source.dtype in (torch.bfloat16, torch.float16)
     assert initial_state_indices is not None, (
         "Pool mode is required: pass initial_state_indices. "
         "Non-pool mode is no longer supported by the BF16 GDN MTP kernels."
@@ -1931,7 +1960,7 @@ def gated_delta_rule_mtp(
         assert cache_steps >= T, (
             f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
         )
-        assert intermediate_states_buffer.dtype == torch.bfloat16
+        assert intermediate_states_buffer.dtype in (torch.bfloat16, torch.float16)
         intermediate_states = intermediate_states_buffer.reshape(
             B * cache_steps * HV, V, K
         )
@@ -1990,8 +2019,9 @@ def gated_delta_rule_mtp(
     # Slot stride may be larger than HV*V*K (vLLM's packed conv+ssm page).
     # Include in cache key — cute.compile bakes the stride into the cubin.
     pool_slot_stride = int(initial_state_source.stride(0))
+    is_bf16 = initial_state_source.dtype == torch.bfloat16
     cache_key = (
-        "mtp_bf16",
+        "mtp_narrow",
         B,
         T,
         H,
@@ -2010,6 +2040,7 @@ def gated_delta_rule_mtp(
         softplus_threshold,
         use_packed_fma,
         same_pool,
+        is_bf16,
     )
     if cache_key not in _compiled_kernels_mtp:
         # First call for this shape: allocate default indices/output and do
@@ -2065,6 +2096,7 @@ def gated_delta_rule_mtp(
                 cache_intermediate_states,
                 use_packed_fma,
                 same_pool,
+                is_bf16,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -2101,3 +2133,8 @@ def gated_delta_rule_mtp(
 # Backward-compatible aliases
 gated_delta_rule_bf16state_cooprow = gated_delta_rule
 gated_delta_rule_bf16state_cooprow_mtp = gated_delta_rule_mtp
+
+# FP16 aliases — the same functions handle both bf16 and fp16 via IS_BF16 constexpr.
+# Exported separately for clarity in the dispatch layer.
+gated_delta_rule_fp16 = gated_delta_rule
+gated_delta_rule_fp16_mtp = gated_delta_rule_mtp

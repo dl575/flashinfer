@@ -92,8 +92,25 @@ def _to_narrow(val, IS_BF16: cutlass.Constexpr[bool]):
 
 
 def _narrow_dtype(is_bf16: bool):
-    """Return the cutlass dtype for register allocation."""
+    """Return the cutlass IO dtype (q/k/v/output) for register allocation."""
     return cutlass.BFloat16 if is_bf16 else cutlass.Float16
+
+
+def _state_dtype(is_bf16: bool, is_fp8: bool):
+    """Return the cutlass STATE-pool dtype for register allocation.
+
+    The recurrent state can be a narrower dtype than the IO (q/k/v) tensors:
+    fp8 (E4M3) state with bf16/fp16 IO. When ``is_fp8`` the state tiles are
+    Float8E4M3FN; otherwise they match the IO dtype (bf16/fp16).
+    """
+    if is_fp8:
+        return cutlass.Float8E4M3FN
+    return cutlass.BFloat16 if is_bf16 else cutlass.Float16
+
+
+# fp8 E4M3 saturates at 448; per-row scale = amax / 448 maps the row's peak
+# magnitude onto the E4M3 grid (matches the SGLang gdn-cache fp8 path).
+E4M3_MAX = 448.0
 
 
 def _resolve_rand_seed(rand_seed, use_sr, device):
@@ -204,6 +221,52 @@ def _round_state(val, IS_BF16: cutlass.Constexpr[bool],
         return _cvt_rs_narrow(val, rand, IS_BF16)
     else:
         return _to_narrow(val, IS_BF16)
+
+
+@cute.jit
+def _cvt_rs_e4m3x4(a, b, c, d, rbits):
+    """Stochastic-round 4 fp32 → packed u32 of 4 e4m3 (byte i = e4m3(input_i)).
+
+    Hardware ``cvt.rs.satfinite.e4m3x4.f32`` (Blackwell sm_100a+). Reversed
+    source order {$4,$3,$2,$1} and ``.satfinite`` are both mandatory (the HW
+    packs MSB-first and ptxas rejects e4m3x4 without satfinite). ``rbits`` must
+    carry full 32-bit randomness — the HW splits it into two 16-bit chunks, one
+    per output pair. See conversion.cuh:382-401.
+    """
+    a_ir = cutlass.Float32(a).ir_value()
+    b_ir = cutlass.Float32(b).ir_value()
+    c_ir = cutlass.Float32(c).ir_value()
+    d_ir = cutlass.Float32(d).ir_value()
+    r_ir = cutlass.Uint32(rbits).ir_value()
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [a_ir, b_ir, c_ir, d_ir, r_ir],
+            "cvt.rs.satfinite.e4m3x4.f32 $0, {$4, $3, $2, $1}, $5;",
+            "=r,r,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _row_amax(local_amax):
+    """Butterfly-reduce |state| amax across the 16 lanes holding one K=128 row.
+
+    XOR offsets 1,2,4,8 stay within each aligned 16-lane block, so a full-warp
+    shuffle (mask_and_clamp=31) reduces per-row without leaking across rows.
+    clamp=15 would wrongly clamp source lanes >15 and break the upper half-warp.
+    """
+    amax = local_amax
+    for off in cutlass.range_constexpr(4):
+        offset = 1 << off
+        other = cute.arch.shuffle_sync_bfly(
+            amax, offset=offset, mask=-1, mask_and_clamp=31
+        )
+        amax = other if other > amax else amax
+    return amax
 
 
 MTP_NUM_THREADS = 128

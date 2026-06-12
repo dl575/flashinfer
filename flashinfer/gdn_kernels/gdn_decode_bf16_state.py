@@ -48,6 +48,8 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
+from cutlass._mlir.dialects import llvm
+from cutlass._mlir.extras import types as T
 
 from flashinfer.cute_dsl.fp4_common import get_sm_version
 from flashinfer.cute_dsl.utils import get_num_sm
@@ -92,6 +94,116 @@ def _to_narrow(val, IS_BF16: cutlass.Constexpr[bool]):
 def _narrow_dtype(is_bf16: bool):
     """Return the cutlass dtype for register allocation."""
     return cutlass.BFloat16 if is_bf16 else cutlass.Float16
+
+
+def _resolve_rand_seed(rand_seed, use_sr, device):
+    """Return a valid [2]-int32 (lo, hi) Philox seed tensor on ``device``.
+
+    If the caller passes ``rand_seed`` it is used as-is (the CUDA-graph-safe
+    path — the caller is responsible for advancing it each step). Otherwise a
+    fresh per-call seed is drawn on-device when SR is on (no host sync), or a
+    dummy zero seed when SR is off (the kernel never reads it).
+    """
+    if rand_seed is not None:
+        return rand_seed
+    if use_sr:
+        return torch.randint(0, 2**31, (2,), device=device, dtype=torch.int32)
+    return torch.zeros(2, dtype=torch.int32, device=device)
+
+
+# ==============================================================================
+# Stochastic rounding: Philox-4x32 RNG + hardware cvt.rs (SM100+ Blackwell)
+# ==============================================================================
+# Quantizing the recurrent state to a narrow dtype with round-to-nearest biases
+# the state over a long decode (errors accumulate in one direction). Stochastic
+# rounding (SR) rounds up/down with probability proportional to the residual, so
+# the quantization is unbiased in expectation.
+#
+# Philox-4x32 here is bit-identical to Triton's ``tl.randint`` and to the C++
+# reference in ``include/flashinfer/mamba/conversion.cuh`` (same constants,
+# unsigned multiply-high). The hardware ``cvt.rs.{f16,bf16}x2.f32`` instruction
+# (Blackwell, sm_100a+) consumes 13 random bits per element and rounds fp32 →
+# narrow stochastically in one op. We use the packed-2 form with a dummy second
+# input and keep the low half (matches ``cvt_rs_f16_f32`` in conversion.cuh).
+
+PHILOX_KEY_A = 0x9E3779B9
+PHILOX_KEY_B = 0xBB67AE85
+PHILOX_ROUND_A = 0xD2511F53
+PHILOX_ROUND_B = 0xCD9E8D57
+
+
+@cute.jit
+def _philox_randint(seed_lo, seed_hi, offset, ROUNDS: cutlass.Constexpr[int]):
+    """One Philox-4x32 output (c0) from (seed, offset). Unsigned arithmetic.
+
+    Bit-identical to ``tl.randint(seed, offset, ROUNDS)`` and to
+    ``philox_randint`` in conversion.cuh. ``offset`` is a Uint32 counter; the
+    high counter word is 0 (matches the int64-offset low/high split when the
+    offset fits in 32 bits, which holds for per-layer state element indices).
+    """
+    KEY_A = cutlass.Uint32(PHILOX_KEY_A)
+    KEY_B = cutlass.Uint32(PHILOX_KEY_B)
+    ROUND_A = cutlass.Uint32(PHILOX_ROUND_A)
+    ROUND_B = cutlass.Uint32(PHILOX_ROUND_B)
+    k0 = seed_lo
+    k1 = seed_hi
+    c0 = offset
+    c1 = cutlass.Uint32(0)
+    c2 = cutlass.Uint32(0)
+    c3 = cutlass.Uint32(0)
+    for _ in cutlass.range(ROUNDS, unroll=1):
+        _c0 = c0
+        _c2 = c2
+        # 3-way XOR via lop3 LUT 0x96; mul_hi on Uint32 = mul.hi.u32 (__umulhi)
+        c0 = cute.arch.lop3(cute.arch.mul_hi(ROUND_B, _c2), c1, k0, 0x96)
+        c2 = cute.arch.lop3(cute.arch.mul_hi(ROUND_A, _c0), c3, k1, 0x96)
+        c1 = ROUND_B * _c2
+        c3 = ROUND_A * _c0
+        k0 = k0 + KEY_A
+        k1 = k1 + KEY_B
+    return c0
+
+
+@cute.jit
+def _cvt_rs_narrow(val, rand13, IS_BF16: cutlass.Constexpr[bool]):
+    """Stochastic-round one fp32 → narrow (bf16/fp16) via PTX cvt.rs.
+
+    Uses the packed-2 instruction with a dummy zero high input and keeps the
+    low fp16/bf16 (matches conversion.cuh ``cvt_rs_f16_f32``). ``rand13`` must
+    carry 13 random bits in [12:0]. Blackwell (sm_100a+) only.
+    """
+    a_ir = cutlass.Float32(val).ir_value()
+    zero_ir = cutlass.Float32(0.0).ir_value()
+    r_ir = (cutlass.Uint32(rand13) & cutlass.Uint32(0x1FFF)).ir_value()
+    if cutlass.const_expr(IS_BF16):
+        asm = "cvt.rs.bf16x2.f32 $0, $2, $1, $3;"
+    else:
+        asm = "cvt.rs.f16x2.f32 $0, $2, $1, $3;"
+    # $1 -> low half (our val), $2 -> high half (dummy 0), $3 -> rbits
+    packed = llvm.inline_asm(
+        T.i32(),
+        [a_ir, zero_ir, r_ir],
+        asm,
+        "=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    # Low 16 bits = SR-rounded narrow value; reinterpret to the narrow dtype.
+    narrow_dtype = _narrow_dtype(cutlass.const_expr(IS_BF16))
+    return cutlass.Uint32(packed).to(cutlass.Uint16).bitcast(narrow_dtype)
+
+
+@cute.jit
+def _round_state(val, IS_BF16: cutlass.Constexpr[bool],
+                 USE_SR: cutlass.Constexpr[bool], seed_lo, seed_hi, offset,
+                 PHILOX_ROUNDS: cutlass.Constexpr[int]):
+    """Quantize one fp32 state element → narrow: SR (cvt.rs) or RTN."""
+    if cutlass.const_expr(USE_SR):
+        rand = _philox_randint(seed_lo, seed_hi, offset, PHILOX_ROUNDS)
+        return _cvt_rs_narrow(val, rand, IS_BF16)
+    else:
+        return _to_narrow(val, IS_BF16)
 
 
 MTP_NUM_THREADS = 128
@@ -160,6 +272,9 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
     IS_BF16: cutlass.Constexpr[bool],
+    rand_seed: cute.Tensor,
+    USE_SR: cutlass.Constexpr[bool],
+    PHILOX_ROUNDS: cutlass.Constexpr[int],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -186,6 +301,13 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     i_hv = tmp % HV
     i_n = tmp // HV
     i_h = i_hv // (HV // H)
+
+    # Stochastic-rounding seed (loaded once; zero-cost when USE_SR is False).
+    seed_lo = cutlass.Uint32(0)
+    seed_hi = cutlass.Uint32(0)
+    if cutlass.const_expr(USE_SR):
+        seed_lo = cutlass.Uint32(rand_seed[0])
+        seed_hi = cutlass.Uint32(rand_seed[1])
 
     # Widen pool indices to Int64 BEFORE they multiply ``stride[0]`` of
     # ``h0_source``. The reshape ``[pool_size, HV, V, K] -> [pool_size * HV,
@@ -656,11 +778,19 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                 od = od + od2
 
                 if cutlass.const_expr(cache_intermediate_states):
+                    # Per-element Philox offset = flat state index
+                    # ((i_hv*V + v_row)*K + k). Unique per (hv, v, k) within a
+                    # layer; the per-call seed varies the randomness across
+                    # decode steps. State quantization uses SR; output stays RTN.
+                    off_a = (i_hv * V + va) * K + k_start
+                    off_b = (i_hv * V + vb) * K + k_start
+                    off_c = (i_hv * V + vc) * K + k_start
+                    off_d = (i_hv * V + vd) * K + k_start
                     for i in cutlass.range_constexpr(vec_size):
-                        r_hb4_0[i] = _to_narrow(r_h[0, i], IS_BF16)
-                        r_hb4_1[i] = _to_narrow(r_h[1, i], IS_BF16)
-                        r_hb4_2[i] = _to_narrow(r_h[2, i], IS_BF16)
-                        r_hb4_3[i] = _to_narrow(r_h[3, i], IS_BF16)
+                        r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
+                        r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
+                        r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
+                        r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
 
                 if cutlass.const_expr(cache_intermediate_states):
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
@@ -733,11 +863,15 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
 
             if cutlass.const_expr(not disable_state_update):
                 if cutlass.const_expr(not cache_intermediate_states):
+                    off_a = (i_hv * V + va) * K + k_start
+                    off_b = (i_hv * V + vb) * K + k_start
+                    off_c = (i_hv * V + vc) * K + k_start
+                    off_d = (i_hv * V + vd) * K + k_start
                     for i in cutlass.range_constexpr(vec_size):
-                        r_hb4_0[i] = _to_narrow(r_h[0, i], IS_BF16)
-                        r_hb4_1[i] = _to_narrow(r_h[1, i], IS_BF16)
-                        r_hb4_2[i] = _to_narrow(r_h[2, i], IS_BF16)
-                        r_hb4_3[i] = _to_narrow(r_h[3, i], IS_BF16)
+                        r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
+                        r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
+                        r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
+                        r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
                 cute.autovec_copy(r_hb4_0, hta_w)
                 cute.autovec_copy(r_hb4_1, htb_w)
                 cute.autovec_copy(r_hb4_2, htc_w)
@@ -783,6 +917,9 @@ def gdn_wide_vec_kernel(
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
     IS_BF16: cutlass.Constexpr[bool],
+    rand_seed: cute.Tensor,
+    USE_SR: cutlass.Constexpr[bool],
+    PHILOX_ROUNDS: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -807,6 +944,13 @@ def gdn_wide_vec_kernel(
     i_hv = tmp % HV
     i_n = tmp // HV
     i_h = i_hv // (HV // H)
+
+    # Stochastic-rounding seed (loaded once; zero-cost when USE_SR is False).
+    seed_lo = cutlass.Uint32(0)
+    seed_hi = cutlass.Uint32(0)
+    if cutlass.const_expr(USE_SR):
+        seed_lo = cutlass.Uint32(rand_seed[0])
+        seed_hi = cutlass.Uint32(rand_seed[1])
 
     # Widen pool indices to Int64 BEFORE they multiply ``stride[0]`` of
     # ``h0_source``. ``h0_source`` is reshaped to ``[pool_size * HV, V,
@@ -1182,11 +1326,15 @@ def gdn_wide_vec_kernel(
 
                 # Intermediate write (for every token when caching)
                 if cutlass.const_expr(cache_intermediate_states):
+                    off_0 = (i_hv * V + v0) * K + k_start
+                    off_1 = (i_hv * V + v1) * K + k_start
+                    off_2 = (i_hv * V + v2) * K + k_start
+                    off_3 = (i_hv * V + v3) * K + k_start
                     for i in cutlass.range_constexpr(vec):
-                        r_hb0[i] = _to_narrow(r_h[0, i], IS_BF16)
-                        r_hb1[i] = _to_narrow(r_h[1, i], IS_BF16)
-                        r_hb2[i] = _to_narrow(r_h[2, i], IS_BF16)
-                        r_hb3[i] = _to_narrow(r_h[3, i], IS_BF16)
+                        r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
+                        r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
+                        r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
+                        r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
                     # (the per-call batch index) and not cache_idx (the pool
@@ -1236,11 +1384,15 @@ def gdn_wide_vec_kernel(
             if cutlass.const_expr(
                 not disable_state_update and not cache_intermediate_states
             ):
+                off_0 = (i_hv * V + v0) * K + k_start
+                off_1 = (i_hv * V + v1) * K + k_start
+                off_2 = (i_hv * V + v2) * K + k_start
+                off_3 = (i_hv * V + v3) * K + k_start
                 for i in cutlass.range_constexpr(vec):
-                    r_hb0[i] = _to_narrow(r_h[0, i], IS_BF16)
-                    r_hb1[i] = _to_narrow(r_h[1, i], IS_BF16)
-                    r_hb2[i] = _to_narrow(r_h[2, i], IS_BF16)
-                    r_hb3[i] = _to_narrow(r_h[3, i], IS_BF16)
+                    r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
+                    r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
+                    r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
+                    r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
                 cute.autovec_copy(r_hb0, ht_w0)
                 cute.autovec_copy(r_hb1, ht_w1)
                 cute.autovec_copy(r_hb2, ht_w2)
@@ -1282,6 +1434,9 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
     IS_BF16: cutlass.Constexpr[bool],
+    rand_seed: cute.Tensor,
+    USE_SR: cutlass.Constexpr[bool],
+    PHILOX_ROUNDS: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -1333,6 +1488,9 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         use_packed_fma,
         same_pool,
         IS_BF16,
+        rand_seed,
+        USE_SR,
+        PHILOX_ROUNDS,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -1376,6 +1534,9 @@ def _run_wide_vec(
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
     IS_BF16: cutlass.Constexpr[bool],
+    rand_seed: cute.Tensor,
+    USE_SR: cutlass.Constexpr[bool],
+    PHILOX_ROUNDS: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
@@ -1416,6 +1577,9 @@ def _run_wide_vec(
         use_packed_fma,
         same_pool,
         IS_BF16,
+        rand_seed,
+        USE_SR,
+        PHILOX_ROUNDS,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -1445,6 +1609,9 @@ def gated_delta_rule(
     output: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
+    use_sr: bool = False,
+    philox_rounds: int = 10,
+    rand_seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     GDN decode T=1 with BF16 state (pool mode, K=V=128 only).
@@ -1530,6 +1697,9 @@ def gated_delta_rule(
             scale=scale,
             output=output,
             tile_v=wv_tile_v,
+            use_sr=use_sr,
+            philox_rounds=philox_rounds,
+            rand_seed=rand_seed,
         )
 
     # Wide_vec didn't fire (B*HV too small at T=1, i.e. tile_v < 64).
@@ -1551,6 +1721,9 @@ def gated_delta_rule(
         output=output,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         scale=scale,
+        use_sr=use_sr,
+        philox_rounds=philox_rounds,
+        rand_seed=rand_seed,
     )
 
 
@@ -1667,6 +1840,9 @@ def gated_delta_rule_mtp_wide_vec(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     tile_v: int = 128,
+    use_sr: bool = False,
+    philox_rounds: int = 10,
+    rand_seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Wide-vector BF16 GDN MTP decode.
 
@@ -1689,6 +1865,8 @@ def gated_delta_rule_mtp_wide_vec(
 
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
+
+    rand_seed = _resolve_rand_seed(rand_seed, use_sr, q.device)
 
     B_val, T_val, H_val, K_val = q.shape
     HV_val = v.shape[2]
@@ -1772,6 +1950,8 @@ def gated_delta_rule_mtp_wide_vec(
         use_packed_fma,
         same_pool,
         is_bf16,
+        use_sr,
+        philox_rounds,
     )
     if cache_key not in _compiled_kernels_wide_vec:
         default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
@@ -1803,6 +1983,7 @@ def gated_delta_rule_mtp_wide_vec(
         h0_out_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
         )
+        rand_seed_ = from_dlpack(rand_seed, assumed_align=32, enable_tvm_ffi=True)
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -1835,6 +2016,9 @@ def gated_delta_rule_mtp_wide_vec(
                 use_packed_fma,
                 same_pool,
                 is_bf16,
+                rand_seed_,
+                use_sr,
+                philox_rounds,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -1865,6 +2049,7 @@ def gated_delta_rule_mtp_wide_vec(
         output,
         initial_state_indices,
         output_state_indices,
+        rand_seed,
         stream,
     )
     return output
@@ -1888,6 +2073,9 @@ def gated_delta_rule_mtp(
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
+    use_sr: bool = False,
+    philox_rounds: int = 10,
+    rand_seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     GDN MTP (Multiple Token Processing) with BF16 state.
@@ -1922,6 +2110,8 @@ def gated_delta_rule_mtp(
 
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
+
+    rand_seed = _resolve_rand_seed(rand_seed, use_sr, q.device)
 
     B, T, H, K = q.shape
     HV = v.shape[2]
@@ -2041,6 +2231,8 @@ def gated_delta_rule_mtp(
         use_packed_fma,
         same_pool,
         is_bf16,
+        use_sr,
+        philox_rounds,
     )
     if cache_key not in _compiled_kernels_mtp:
         # First call for this shape: allocate default indices/output and do
@@ -2065,6 +2257,7 @@ def gated_delta_rule_mtp(
         h0_out_idx_ = from_dlpack(
             default_indices, assumed_align=32, enable_tvm_ffi=True
         )
+        rand_seed_ = from_dlpack(rand_seed, assumed_align=32, enable_tvm_ffi=True)
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -2097,6 +2290,9 @@ def gated_delta_rule_mtp(
                 use_packed_fma,
                 same_pool,
                 is_bf16,
+                rand_seed_,
+                use_sr,
+                philox_rounds,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -2124,6 +2320,7 @@ def gated_delta_rule_mtp(
         output,
         initial_state_indices,
         output_state_indices,
+        rand_seed,
         stream,
     )
 

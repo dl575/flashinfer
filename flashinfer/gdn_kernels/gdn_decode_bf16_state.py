@@ -286,6 +286,54 @@ def _row_amax(local_amax):
     return amax
 
 
+@cute.jit
+def _fp8_byte(packed, e: cutlass.Constexpr[int]):
+    """Extract byte ``e`` of a packed-4 e4m3 u32 as a Float8E4M3FN scalar.
+
+    Mirrors the validated f16 ``.to(Uint16).bitcast`` extraction from the SR
+    store. ``e`` is compile-time (the lane within a 4-pack).
+    """
+    byte = (cutlass.Uint32(packed) >> (8 * e)) & cutlass.Uint32(0xFF)
+    return byte.to(cutlass.Uint8).bitcast(cutlass.Float8E4M3FN)
+
+
+@cute.jit
+def _fp8_row_scale(r_h, row: cutlass.Constexpr[int], vec: cutlass.Constexpr[int]):
+    """Per-row fp8 scale = (warp-reduced amax over K) / 448, guarded > 0."""
+    local = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(vec):
+        av = cute.arch.fmax(r_h[row, i], -r_h[row, i])  # |x|; no cute.arch.fabs
+        local = av if av > local else local
+    amax = _row_amax(local)
+    scale = amax / cutlass.Float32(E4M3_MAX)
+    return scale if scale > cutlass.Float32(0.0) else cutlass.Float32(1.0)
+
+
+@cute.jit
+def _fp8_quant_row(tile, r_h, row: cutlass.Constexpr[int], inv,
+                   USE_SR: cutlass.Constexpr[bool], seed_lo, seed_hi, off_base,
+                   PHILOX_ROUNDS: cutlass.Constexpr[int],
+                   vec: cutlass.Constexpr[int]):
+    """Quantize row ``row`` of r_h (× inv-scale) → fp8 into ``tile`` (vec elems).
+
+    SR: e4m3x4 (packed-4) with one Philox draw per group of 4; RTN: per-element
+    Float8E4M3FN cast. ``tile`` is the fp8 register tile for this row.
+    """
+    if cutlass.const_expr(USE_SR):
+        for j in cutlass.range_constexpr(vec // 4):
+            b = j * 4
+            rb = _philox_randint(seed_lo, seed_hi, off_base + j, PHILOX_ROUNDS)
+            packed = _cvt_rs_e4m3x4(
+                r_h[row, b] * inv, r_h[row, b + 1] * inv,
+                r_h[row, b + 2] * inv, r_h[row, b + 3] * inv, rb,
+            )
+            for e in cutlass.range_constexpr(4):
+                tile[b + e] = _fp8_byte(packed, e)
+    else:
+        for i in cutlass.range_constexpr(vec):
+            tile[i] = cutlass.Float8E4M3FN(r_h[row, i] * inv)
+
+
 MTP_NUM_THREADS = 128
 MTP_VEC_SIZE = 4  # 32 threads per group x 4 = 128 K elements
 
@@ -962,11 +1010,29 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     off_b = (i_hv * V + vb) * K + k_start
                     off_c = (i_hv * V + vc) * K + k_start
                     off_d = (i_hv * V + vd) * K + k_start
-                    for i in cutlass.range_constexpr(vec_size):
-                        r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
-                        r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
-                        r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
-                        r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
+                    if cutlass.const_expr(IS_FP8):
+                        # Per-row amax → scale → quantize. Scale written to the
+                        # WRITE slot by lane 0; the 4 e4m3 bytes per group of 4
+                        # K-elements are unpacked into the fp8 tile.
+                        sca = _fp8_row_scale(r_h, 0, vec_size)
+                        scb = _fp8_row_scale(r_h, 1, vec_size)
+                        scc = _fp8_row_scale(r_h, 2, vec_size)
+                        scd = _fp8_row_scale(r_h, 3, vec_size)
+                        if lane_in_group == 0:
+                            h0_scale_source[(write_cache_idx, i_hv, va)] = sca
+                            h0_scale_source[(write_cache_idx, i_hv, vb)] = scb
+                            h0_scale_source[(write_cache_idx, i_hv, vc)] = scc
+                            h0_scale_source[(write_cache_idx, i_hv, vd)] = scd
+                        _fp8_quant_row(r_hb4_0, r_h, 0, 1.0 / sca, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a), PHILOX_ROUNDS, vec_size)
+                        _fp8_quant_row(r_hb4_1, r_h, 1, 1.0 / scb, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b), PHILOX_ROUNDS, vec_size)
+                        _fp8_quant_row(r_hb4_2, r_h, 2, 1.0 / scc, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c), PHILOX_ROUNDS, vec_size)
+                        _fp8_quant_row(r_hb4_3, r_h, 3, 1.0 / scd, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d), PHILOX_ROUNDS, vec_size)
+                    else:
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
+                            r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
+                            r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
+                            r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
                 cute.autovec_copy(r_hb4_0, hta_w)
                 cute.autovec_copy(r_hb4_1, htb_w)
                 cute.autovec_copy(r_hb4_2, htc_w)
@@ -1263,11 +1329,22 @@ def gdn_wide_vec_kernel(
             cute.autovec_copy(ht1, r_hb1)
             cute.autovec_copy(ht2, r_hb2)
             cute.autovec_copy(ht3, r_hb3)
-            for i in cutlass.range_constexpr(vec):
-                r_h[0, i] = cutlass.Float32(r_hb0[i])
-                r_h[1, i] = cutlass.Float32(r_hb1[i])
-                r_h[2, i] = cutlass.Float32(r_hb2[i])
-                r_h[3, i] = cutlass.Float32(r_hb3[i])
+            if cutlass.const_expr(IS_FP8):
+                s0 = h0_scale_source[(cache_idx, i_hv, v0)].to(cutlass.Float32)
+                s1 = h0_scale_source[(cache_idx, i_hv, v1)].to(cutlass.Float32)
+                s2 = h0_scale_source[(cache_idx, i_hv, v2)].to(cutlass.Float32)
+                s3 = h0_scale_source[(cache_idx, i_hv, v3)].to(cutlass.Float32)
+                for i in cutlass.range_constexpr(vec):
+                    r_h[0, i] = cutlass.Float32(r_hb0[i]) * s0
+                    r_h[1, i] = cutlass.Float32(r_hb1[i]) * s1
+                    r_h[2, i] = cutlass.Float32(r_hb2[i]) * s2
+                    r_h[3, i] = cutlass.Float32(r_hb3[i]) * s3
+            else:
+                for i in cutlass.range_constexpr(vec):
+                    r_h[0, i] = cutlass.Float32(r_hb0[i])
+                    r_h[1, i] = cutlass.Float32(r_hb1[i])
+                    r_h[2, i] = cutlass.Float32(r_hb2[i])
+                    r_h[3, i] = cutlass.Float32(r_hb3[i])
 
             # Process each token sequentially (state is carried in registers).
             # Non-fused form for numerical robustness: compute s = h_decayed @ k,
@@ -1485,11 +1562,26 @@ def gdn_wide_vec_kernel(
                 off_1 = (i_hv * V + v1) * K + k_start
                 off_2 = (i_hv * V + v2) * K + k_start
                 off_3 = (i_hv * V + v3) * K + k_start
-                for i in cutlass.range_constexpr(vec):
-                    r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
-                    r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
-                    r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
-                    r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
+                if cutlass.const_expr(IS_FP8):
+                    sc0 = _fp8_row_scale(r_h, 0, vec)
+                    sc1 = _fp8_row_scale(r_h, 1, vec)
+                    sc2 = _fp8_row_scale(r_h, 2, vec)
+                    sc3 = _fp8_row_scale(r_h, 3, vec)
+                    if lane_in_group == 0:
+                        h0_scale_source[(write_cache_idx, i_hv, v0)] = sc0
+                        h0_scale_source[(write_cache_idx, i_hv, v1)] = sc1
+                        h0_scale_source[(write_cache_idx, i_hv, v2)] = sc2
+                        h0_scale_source[(write_cache_idx, i_hv, v3)] = sc3
+                    _fp8_quant_row(r_hb0, r_h, 0, 1.0 / sc0, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0), PHILOX_ROUNDS, vec)
+                    _fp8_quant_row(r_hb1, r_h, 1, 1.0 / sc1, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1), PHILOX_ROUNDS, vec)
+                    _fp8_quant_row(r_hb2, r_h, 2, 1.0 / sc2, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2), PHILOX_ROUNDS, vec)
+                    _fp8_quant_row(r_hb3, r_h, 3, 1.0 / sc3, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3), PHILOX_ROUNDS, vec)
+                else:
+                    for i in cutlass.range_constexpr(vec):
+                        r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
+                        r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
+                        r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
+                        r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
                 cute.autovec_copy(r_hb0, ht_w0)
                 cute.autovec_copy(r_hb1, ht_w1)
                 cute.autovec_copy(r_hb2, ht_w2)

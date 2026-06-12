@@ -651,15 +651,15 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             # fp8 state is dequantized on load: r_h = fp8 * per-row scale. The
             # scale pool is [pool, HV, V] fp32, indexed by the read slot.
             if cutlass.const_expr(IS_FP8):
-                sa = h0_scale_source[(cache_idx, i_hv, va)].to(cutlass.Float32)
-                sb = h0_scale_source[(cache_idx, i_hv, vb)].to(cutlass.Float32)
-                sc = h0_scale_source[(cache_idx, i_hv, vc)].to(cutlass.Float32)
-                sd = h0_scale_source[(cache_idx, i_hv, vd)].to(cutlass.Float32)
+                dqa = h0_scale_source[(cache_idx, i_hv, va)].to(cutlass.Float32)
+                dqb = h0_scale_source[(cache_idx, i_hv, vb)].to(cutlass.Float32)
+                dqc = h0_scale_source[(cache_idx, i_hv, vc)].to(cutlass.Float32)
+                dqd = h0_scale_source[(cache_idx, i_hv, vd)].to(cutlass.Float32)
                 for i in cutlass.range_constexpr(vec_size):
-                    r_h[0, i] = cutlass.Float32(r_hb4_0[i]) * sa
-                    r_h[1, i] = cutlass.Float32(r_hb4_1[i]) * sb
-                    r_h[2, i] = cutlass.Float32(r_hb4_2[i]) * sc
-                    r_h[3, i] = cutlass.Float32(r_hb4_3[i]) * sd
+                    r_h[0, i] = cutlass.Float32(r_hb4_0[i]) * dqa
+                    r_h[1, i] = cutlass.Float32(r_hb4_1[i]) * dqb
+                    r_h[2, i] = cutlass.Float32(r_hb4_2[i]) * dqc
+                    r_h[3, i] = cutlass.Float32(r_hb4_3[i]) * dqd
             else:
                 for i in cutlass.range_constexpr(vec_size):
                     r_h[0, i] = cutlass.Float32(r_hb4_0[i])
@@ -1330,15 +1330,15 @@ def gdn_wide_vec_kernel(
             cute.autovec_copy(ht2, r_hb2)
             cute.autovec_copy(ht3, r_hb3)
             if cutlass.const_expr(IS_FP8):
-                s0 = h0_scale_source[(cache_idx, i_hv, v0)].to(cutlass.Float32)
-                s1 = h0_scale_source[(cache_idx, i_hv, v1)].to(cutlass.Float32)
-                s2 = h0_scale_source[(cache_idx, i_hv, v2)].to(cutlass.Float32)
-                s3 = h0_scale_source[(cache_idx, i_hv, v3)].to(cutlass.Float32)
+                dq0 = h0_scale_source[(cache_idx, i_hv, v0)].to(cutlass.Float32)
+                dq1 = h0_scale_source[(cache_idx, i_hv, v1)].to(cutlass.Float32)
+                dq2 = h0_scale_source[(cache_idx, i_hv, v2)].to(cutlass.Float32)
+                dq3 = h0_scale_source[(cache_idx, i_hv, v3)].to(cutlass.Float32)
                 for i in cutlass.range_constexpr(vec):
-                    r_h[0, i] = cutlass.Float32(r_hb0[i]) * s0
-                    r_h[1, i] = cutlass.Float32(r_hb1[i]) * s1
-                    r_h[2, i] = cutlass.Float32(r_hb2[i]) * s2
-                    r_h[3, i] = cutlass.Float32(r_hb3[i]) * s3
+                    r_h[0, i] = cutlass.Float32(r_hb0[i]) * dq0
+                    r_h[1, i] = cutlass.Float32(r_hb1[i]) * dq1
+                    r_h[2, i] = cutlass.Float32(r_hb2[i]) * dq2
+                    r_h[3, i] = cutlass.Float32(r_hb3[i]) * dq3
             else:
                 for i in cutlass.range_constexpr(vec):
                     r_h[0, i] = cutlass.Float32(r_hb0[i])
@@ -1563,19 +1563,19 @@ def gdn_wide_vec_kernel(
                 off_2 = (i_hv * V + v2) * K + k_start
                 off_3 = (i_hv * V + v3) * K + k_start
                 if cutlass.const_expr(IS_FP8):
-                    sc0 = _fp8_row_scale(r_h, 0, vec)
-                    sc1 = _fp8_row_scale(r_h, 1, vec)
-                    sc2 = _fp8_row_scale(r_h, 2, vec)
-                    sc3 = _fp8_row_scale(r_h, 3, vec)
+                    qs0 = _fp8_row_scale(r_h, 0, vec)
+                    qs1 = _fp8_row_scale(r_h, 1, vec)
+                    qs2 = _fp8_row_scale(r_h, 2, vec)
+                    qs3 = _fp8_row_scale(r_h, 3, vec)
                     if lane_in_group == 0:
-                        h0_scale_source[(write_cache_idx, i_hv, v0)] = sc0
-                        h0_scale_source[(write_cache_idx, i_hv, v1)] = sc1
-                        h0_scale_source[(write_cache_idx, i_hv, v2)] = sc2
-                        h0_scale_source[(write_cache_idx, i_hv, v3)] = sc3
-                    _fp8_quant_row(r_hb0, r_h, 0, 1.0 / sc0, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0), PHILOX_ROUNDS, vec)
-                    _fp8_quant_row(r_hb1, r_h, 1, 1.0 / sc1, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1), PHILOX_ROUNDS, vec)
-                    _fp8_quant_row(r_hb2, r_h, 2, 1.0 / sc2, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2), PHILOX_ROUNDS, vec)
-                    _fp8_quant_row(r_hb3, r_h, 3, 1.0 / sc3, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3), PHILOX_ROUNDS, vec)
+                        h0_scale_source[(write_cache_idx, i_hv, v0)] = qs0
+                        h0_scale_source[(write_cache_idx, i_hv, v1)] = qs1
+                        h0_scale_source[(write_cache_idx, i_hv, v2)] = qs2
+                        h0_scale_source[(write_cache_idx, i_hv, v3)] = qs3
+                    _fp8_quant_row(r_hb0, r_h, 0, 1.0 / qs0, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0), PHILOX_ROUNDS, vec)
+                    _fp8_quant_row(r_hb1, r_h, 1, 1.0 / qs1, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1), PHILOX_ROUNDS, vec)
+                    _fp8_quant_row(r_hb2, r_h, 2, 1.0 / qs2, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2), PHILOX_ROUNDS, vec)
+                    _fp8_quant_row(r_hb3, r_h, 3, 1.0 / qs3, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3), PHILOX_ROUNDS, vec)
                 else:
                     for i in cutlass.range_constexpr(vec):
                         r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)

@@ -920,7 +920,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                 oc = oc + oc2
                 od = od + od2
 
-                if cutlass.const_expr(cache_intermediate_states):
+                # fp8 intermediate is FP32 (lossless snapshot); the fp32->E4M3 SR
+                # quantization happens at the sglang commit, not here, so only the
+                # bf16/fp16 path rounds (with SR) into the narrow buffer.
+                if cutlass.const_expr(cache_intermediate_states and not IS_FP8):
                     # Per-element Philox offset = flat state index
                     # ((i_hv*V + v_row)*K + k). Unique per (hv, v, k) within a
                     # layer; the per-call seed varies the randomness across
@@ -973,10 +976,18 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         (1, 1, vec_size),
                         (flat_idx, vd, lane_in_group),
                     )
-                    cute.autovec_copy(r_hb4_0, ita)
-                    cute.autovec_copy(r_hb4_1, itb)
-                    cute.autovec_copy(r_hb4_2, itc)
-                    cute.autovec_copy(r_hb4_3, itd)
+                    if cutlass.const_expr(IS_FP8):
+                        # FP32 snapshot: copy the fp32 recurrent state directly
+                        # into the (fp32) intermediate buffer — no rounding.
+                        cute.autovec_copy(cute.slice_(r_h, (0, None)), ita)
+                        cute.autovec_copy(cute.slice_(r_h, (1, None)), itb)
+                        cute.autovec_copy(cute.slice_(r_h, (2, None)), itc)
+                        cute.autovec_copy(cute.slice_(r_h, (3, None)), itd)
+                    else:
+                        cute.autovec_copy(r_hb4_0, ita)
+                        cute.autovec_copy(r_hb4_1, itb)
+                        cute.autovec_copy(r_hb4_2, itc)
+                        cute.autovec_copy(r_hb4_3, itd)
 
                 for offset in [16, 8, 4, 2, 1]:
                     oa += cute.arch.shuffle_sync_bfly(
@@ -1500,15 +1511,18 @@ def gdn_wide_vec_kernel(
 
                 # Intermediate write (for every token when caching)
                 if cutlass.const_expr(cache_intermediate_states):
-                    off_0 = (i_hv * V + v0) * K + k_start
-                    off_1 = (i_hv * V + v1) * K + k_start
-                    off_2 = (i_hv * V + v2) * K + k_start
-                    off_3 = (i_hv * V + v3) * K + k_start
-                    for i in cutlass.range_constexpr(vec):
-                        r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
-                        r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
-                        r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
-                        r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
+                    # fp8 intermediate is FP32 (lossless); only bf16/fp16 rounds
+                    # (with SR) here — fp8's fp32->E4M3 SR is at the sglang commit.
+                    if cutlass.const_expr(not IS_FP8):
+                        off_0 = (i_hv * V + v0) * K + k_start
+                        off_1 = (i_hv * V + v1) * K + k_start
+                        off_2 = (i_hv * V + v2) * K + k_start
+                        off_3 = (i_hv * V + v3) * K + k_start
+                        for i in cutlass.range_constexpr(vec):
+                            r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
+                            r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
+                            r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
+                            r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
                     # (the per-call batch index) and not cache_idx (the pool
@@ -1548,10 +1562,18 @@ def gdn_wide_vec_kernel(
                         (1, 1, vec),
                         (flat_idx, v3, lane_in_group),
                     )
-                    cute.autovec_copy(r_hb0, it0)
-                    cute.autovec_copy(r_hb1, it1)
-                    cute.autovec_copy(r_hb2, it2)
-                    cute.autovec_copy(r_hb3, it3)
+                    if cutlass.const_expr(IS_FP8):
+                        # FP32 snapshot: copy the fp32 recurrent state directly
+                        # into the (fp32) intermediate buffer — no rounding.
+                        cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
+                        cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
+                        cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
+                        cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
+                    else:
+                        cute.autovec_copy(r_hb0, it0)
+                        cute.autovec_copy(r_hb1, it1)
+                        cute.autovec_copy(r_hb2, it2)
+                        cute.autovec_copy(r_hb3, it3)
 
             # Final state write-back to the split-pool WRITE slot. Skipped when
             # caching is enabled (inter[T-1] already holds the final state).
@@ -2101,7 +2123,11 @@ def gated_delta_rule_mtp_wide_vec(
             f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
         )
         assert cache_steps >= T_val
-        assert intermediate_states_buffer.dtype in (torch.bfloat16, torch.float16)
+        assert intermediate_states_buffer.dtype in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        )
         intermediate_states = intermediate_states_buffer.reshape(
             B_val * cache_steps * HV_val, V_val, K_val
         )
@@ -2370,7 +2396,11 @@ def gated_delta_rule_mtp(
         assert cache_steps >= T, (
             f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
         )
-        assert intermediate_states_buffer.dtype in (torch.bfloat16, torch.float16)
+        assert intermediate_states_buffer.dtype in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        )
         intermediate_states = intermediate_states_buffer.reshape(
             B * cache_steps * HV, V, K
         )
@@ -2410,6 +2440,10 @@ def gated_delta_rule_mtp(
             scale=scale,
             output=output,
             tile_v=wv_tile_v,
+            use_sr=use_sr,
+            philox_rounds=philox_rounds,
+            rand_seed=rand_seed,
+            state_scale=state_scale,
         )
 
     # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch

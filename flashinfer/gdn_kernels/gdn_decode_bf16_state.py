@@ -399,7 +399,8 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
-    IS_BF16: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],  # IO (q/k/v/output) dtype
+    IS_BF16_STATE: cutlass.Constexpr[bool],  # cached recurrent-state dtype
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
@@ -495,16 +496,16 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
         cute.make_layout((vec_size,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb4_0 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
     r_hb4_1 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
     r_hb4_2 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
     r_hb4_3 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec_size,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
     r_o4_bf16 = cute.make_rmem_tensor(
         cute.make_layout((ILP4,), stride=(1,)), _narrow_dtype(IS_BF16)
@@ -933,10 +934,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     off_c = (i_hv * V + vc) * K + k_start
                     off_d = (i_hv * V + vd) * K + k_start
                     for i in cutlass.range_constexpr(vec_size):
-                        r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
-                        r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
-                        r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
-                        r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
+                        r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
+                        r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
+                        r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
+                        r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
 
                 if cutlass.const_expr(cache_intermediate_states):
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
@@ -1040,10 +1041,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         _fp8_quant_row(r_hb4_3, r_h, 3, 1.0 / scd, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d), PHILOX_ROUNDS, vec_size)
                     else:
                         for i in cutlass.range_constexpr(vec_size):
-                            r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
-                            r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
-                            r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
-                            r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
+                            r_hb4_0[i] = _round_state(r_h[0, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_a + i), PHILOX_ROUNDS)
+                            r_hb4_1[i] = _round_state(r_h[1, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_b + i), PHILOX_ROUNDS)
+                            r_hb4_2[i] = _round_state(r_h[2, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_c + i), PHILOX_ROUNDS)
+                            r_hb4_3[i] = _round_state(r_h[3, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_d + i), PHILOX_ROUNDS)
                 cute.autovec_copy(r_hb4_0, hta_w)
                 cute.autovec_copy(r_hb4_1, htb_w)
                 cute.autovec_copy(r_hb4_2, htc_w)
@@ -1088,7 +1089,8 @@ def gdn_wide_vec_kernel(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
-    IS_BF16: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],  # IO (q/k/v/output) dtype
+    IS_BF16_STATE: cutlass.Constexpr[bool],  # cached recurrent-state dtype
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
@@ -1168,16 +1170,16 @@ def gdn_wide_vec_kernel(
         cute.make_layout((vec,), stride=(1,)), _narrow_dtype(IS_BF16)
     )
     r_hb0 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
     r_hb1 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
     r_hb2 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
     r_hb3 = cute.make_rmem_tensor(
-        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16, IS_FP8)
+        cute.make_layout((vec,), stride=(1,)), _state_dtype(IS_BF16_STATE, IS_FP8)
     )
 
     if cache_idx < 0:
@@ -1519,10 +1521,10 @@ def gdn_wide_vec_kernel(
                         off_2 = (i_hv * V + v2) * K + k_start
                         off_3 = (i_hv * V + v3) * K + k_start
                         for i in cutlass.range_constexpr(vec):
-                            r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
-                            r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
-                            r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
-                            r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
+                            r_hb0[i] = _round_state(r_h[0, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
+                            r_hb1[i] = _round_state(r_h[1, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
+                            r_hb2[i] = _round_state(r_h[2, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
+                            r_hb3[i] = _round_state(r_h[3, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
                     # (the per-call batch index) and not cache_idx (the pool
@@ -1600,10 +1602,10 @@ def gdn_wide_vec_kernel(
                     _fp8_quant_row(r_hb3, r_h, 3, 1.0 / qs3, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3), PHILOX_ROUNDS, vec)
                 else:
                     for i in cutlass.range_constexpr(vec):
-                        r_hb0[i] = _round_state(r_h[0, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
-                        r_hb1[i] = _round_state(r_h[1, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
-                        r_hb2[i] = _round_state(r_h[2, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
-                        r_hb3[i] = _round_state(r_h[3, i], IS_BF16, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
+                        r_hb0[i] = _round_state(r_h[0, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_0 + i), PHILOX_ROUNDS)
+                        r_hb1[i] = _round_state(r_h[1, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_1 + i), PHILOX_ROUNDS)
+                        r_hb2[i] = _round_state(r_h[2, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_2 + i), PHILOX_ROUNDS)
+                        r_hb3[i] = _round_state(r_h[3, i], IS_BF16_STATE, USE_SR, seed_lo, seed_hi, cutlass.Uint32(off_3 + i), PHILOX_ROUNDS)
                 cute.autovec_copy(r_hb0, ht_w0)
                 cute.autovec_copy(r_hb1, ht_w1)
                 cute.autovec_copy(r_hb2, ht_w2)
@@ -1644,7 +1646,8 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
-    IS_BF16: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],  # IO (q/k/v/output) dtype
+    IS_BF16_STATE: cutlass.Constexpr[bool],  # cached recurrent-state dtype
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
@@ -1701,6 +1704,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         use_packed_fma,
         same_pool,
         IS_BF16,
+        IS_BF16_STATE,
         rand_seed,
         USE_SR,
         PHILOX_ROUNDS,
@@ -1748,7 +1752,8 @@ def _run_wide_vec(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
-    IS_BF16: cutlass.Constexpr[bool],
+    IS_BF16: cutlass.Constexpr[bool],  # IO (q/k/v/output) dtype
+    IS_BF16_STATE: cutlass.Constexpr[bool],  # cached recurrent-state dtype
     rand_seed: cute.Tensor,
     USE_SR: cutlass.Constexpr[bool],
     PHILOX_ROUNDS: cutlass.Constexpr[int],
@@ -1794,6 +1799,7 @@ def _run_wide_vec(
         use_packed_fma,
         same_pool,
         IS_BF16,
+        IS_BF16_STATE,
         rand_seed,
         USE_SR,
         PHILOX_ROUNDS,
@@ -2159,14 +2165,13 @@ def gated_delta_rule_mtp_wide_vec(
     # IS_BF16 describes the IO (q/k/v) dtype; IS_FP8 the state pool. For fp8
     # state the IO is still bf16/fp16, so derive IS_BF16 from q, not the state.
     is_fp8 = initial_state_source.dtype == torch.float8_e4m3fn
-    # IS_BF16 = IO dtype. For bf16/fp16 state, IO matches the state pool (the
-    # original contract). For fp8 state, IO is independent (q/k/v stay bf16/
-    # fp16), so derive it from q.
-    is_bf16 = (
-        (q.dtype == torch.bfloat16)
-        if is_fp8
-        else (initial_state_source.dtype == torch.bfloat16)
-    )
+    # IS_BF16 = the IO (q/k/v/output) dtype — ALWAYS the model-activation dtype
+    # (from q), independent of the cached-state pool. IS_BF16_STATE = the cached
+    # recurrent-state dtype, decoupled so a narrower state (e.g. fp16 cache with
+    # bf16 IO) is read/written at its own width WITHOUT misreading the bf16 IO
+    # as fp16. (fp8 state is handled via IS_FP8; its state-bf16 flag is moot.)
+    is_bf16 = q.dtype == torch.bfloat16
+    is_bf16_state = initial_state_source.dtype == torch.bfloat16
     h0_scale_source = _resolve_scale_pool(state_scale, is_fp8, q.device)
     cache_key = (
         "v3_mtp_narrow_tiled",
@@ -2188,6 +2193,7 @@ def gated_delta_rule_mtp_wide_vec(
         use_packed_fma,
         same_pool,
         is_bf16,
+        is_bf16_state,
         use_sr,
         philox_rounds,
         is_fp8,
@@ -2258,6 +2264,7 @@ def gated_delta_rule_mtp_wide_vec(
                 use_packed_fma,
                 same_pool,
                 is_bf16,
+                is_bf16_state,
                 rand_seed_,
                 use_sr,
                 philox_rounds,
@@ -2465,14 +2472,13 @@ def gated_delta_rule_mtp(
     pool_slot_stride = int(initial_state_source.stride(0))
     # IS_BF16 = IO (q/k/v) dtype; IS_FP8 = state pool dtype (see wide_vec note).
     is_fp8 = initial_state_source.dtype == torch.float8_e4m3fn
-    # IS_BF16 = IO dtype. For bf16/fp16 state, IO matches the state pool (the
-    # original contract). For fp8 state, IO is independent (q/k/v stay bf16/
-    # fp16), so derive it from q.
-    is_bf16 = (
-        (q.dtype == torch.bfloat16)
-        if is_fp8
-        else (initial_state_source.dtype == torch.bfloat16)
-    )
+    # IS_BF16 = the IO (q/k/v/output) dtype — ALWAYS the model-activation dtype
+    # (from q), independent of the cached-state pool. IS_BF16_STATE = the cached
+    # recurrent-state dtype, decoupled so a narrower state (e.g. fp16 cache with
+    # bf16 IO) is read/written at its own width WITHOUT misreading the bf16 IO
+    # as fp16. (fp8 state is handled via IS_FP8; its state-bf16 flag is moot.)
+    is_bf16 = q.dtype == torch.bfloat16
+    is_bf16_state = initial_state_source.dtype == torch.bfloat16
     h0_scale_source = _resolve_scale_pool(state_scale, is_fp8, q.device)
     cache_key = (
         "mtp_narrow",
@@ -2495,6 +2501,7 @@ def gated_delta_rule_mtp(
         use_packed_fma,
         same_pool,
         is_bf16,
+        is_bf16_state,
         use_sr,
         philox_rounds,
         is_fp8,
@@ -2558,6 +2565,7 @@ def gated_delta_rule_mtp(
                 use_packed_fma,
                 same_pool,
                 is_bf16,
+                is_bf16_state,
                 rand_seed_,
                 use_sr,
                 philox_rounds,

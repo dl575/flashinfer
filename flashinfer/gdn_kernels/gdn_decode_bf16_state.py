@@ -269,15 +269,17 @@ def _cvt_rs_e4m3x4(a, b, c, d, rbits):
 
 
 @cute.jit
-def _row_amax(local_amax):
-    """Butterfly-reduce |state| amax across the 16 lanes holding one K=128 row.
+def _row_amax(local_amax, PASSES: cutlass.Constexpr[int] = 4):
+    """Butterfly-reduce |state| amax across the lanes holding one K=128 row.
 
-    XOR offsets 1,2,4,8 stay within each aligned 16-lane block, so a full-warp
-    shuffle (mask_and_clamp=31) reduces per-row without leaking across rows.
-    clamp=15 would wrongly clamp source lanes >15 and break the upper half-warp.
+    ``PASSES`` controls how many lanes are covered:
+      PASSES=4 → 16 lanes (wide_vec: LANES_PER_ROW=16, ELEMS_PER_LANE=8)
+      PASSES=5 → 32 lanes (ILP4: lane_in_group=lane_id ∈ [0..31], vec_size=4)
+    mask_and_clamp=31 uses the full 32-lane warp mask; XOR offsets stay within
+    each PASSES-sized aligned block so different rows don't leak into each other.
     """
     amax = local_amax
-    for off in cutlass.range_constexpr(4):
+    for off in cutlass.range_constexpr(PASSES):
         offset = 1 << off
         other = cute.arch.shuffle_sync_bfly(
             amax, offset=offset, mask=-1, mask_and_clamp=31
@@ -298,13 +300,21 @@ def _fp8_byte(packed, e: cutlass.Constexpr[int]):
 
 
 @cute.jit
-def _fp8_row_scale(r_h, row: cutlass.Constexpr[int], vec: cutlass.Constexpr[int]):
-    """Per-row fp8 scale = (warp-reduced amax over K) / 448, guarded > 0."""
+def _fp8_row_scale(r_h, row: cutlass.Constexpr[int], vec: cutlass.Constexpr[int],
+                   AMAX_PASSES: cutlass.Constexpr[int] = 4):
+    """Per-row fp8 scale = (warp-reduced amax over K) / 448, guarded > 0.
+
+    ``AMAX_PASSES`` must match the number of lanes covering this K-row:
+      4 passes → 16 lanes (wide_vec kernel, LANES_PER_ROW=16)
+      5 passes → 32 lanes (ILP4 kernel, lane_in_group=lane_id ∈ [0..31])
+    Using 4 passes in the ILP4 kernel computed the amax over only half the K
+    elements (e.g. K[0..63] for lanes 0-15), letting the other half overflow fp8.
+    """
     local = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(vec):
         av = cute.arch.fmax(r_h[row, i], -r_h[row, i])  # |x|; no cute.arch.fabs
         local = av if av > local else local
-    amax = _row_amax(local)
+    amax = _row_amax(local, AMAX_PASSES)
     scale = amax / cutlass.Float32(E4M3_MAX)
     return scale if scale > cutlass.Float32(0.0) else cutlass.Float32(1.0)
 
@@ -1026,10 +1036,12 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         # Per-row amax → scale → quantize. Scale written to the
                         # WRITE slot by lane 0; the 4 e4m3 bytes per group of 4
                         # K-elements are unpacked into the fp8 tile.
-                        sca = _fp8_row_scale(r_h, 0, vec_size)
-                        scb = _fp8_row_scale(r_h, 1, vec_size)
-                        scc = _fp8_row_scale(r_h, 2, vec_size)
-                        scd = _fp8_row_scale(r_h, 3, vec_size)
+                        # ILP4: lane_in_group=lane_id ∈ [0..31] covers K=128 with
+                        # vec_size=4; need 5 butterfly passes (32 lanes).
+                        sca = _fp8_row_scale(r_h, 0, vec_size, 5)
+                        scb = _fp8_row_scale(r_h, 1, vec_size, 5)
+                        scc = _fp8_row_scale(r_h, 2, vec_size, 5)
+                        scd = _fp8_row_scale(r_h, 3, vec_size, 5)
                         if lane_in_group == 0:
                             h0_scale_source[(write_cache_idx, i_hv, va)] = sca
                             h0_scale_source[(write_cache_idx, i_hv, vb)] = scb

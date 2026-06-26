@@ -66,6 +66,19 @@ except (ImportError, RuntimeError):
     _gated_delta_rule_bf16_state = None
     _gated_delta_rule_bf16_state_mtp = None
 
+# GDN decode FP16 state kernels — same kernel as BF16 (parameterized by IS_BF16)
+try:
+    from .gdn_kernels.gdn_decode_bf16_state import (
+        gated_delta_rule_fp16 as _gated_delta_rule_fp16_state,
+        gated_delta_rule_fp16_mtp as _gated_delta_rule_fp16_state_mtp,
+    )
+
+    _GDN_DECODE_FP16_STATE_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _GDN_DECODE_FP16_STATE_AVAILABLE = False
+    _gated_delta_rule_fp16_state = None
+    _gated_delta_rule_fp16_state_mtp = None
+
 # Pretranspose decode kernel (V-major state, T=1)
 try:
     from .gdn_kernels.gdn_decode_pretranspose import run_pretranspose_decode
@@ -130,6 +143,10 @@ def gated_delta_rule_decode_pretranspose(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
+    use_sr: bool = False,
+    philox_rounds: int = 10,
+    rand_seed: Optional[torch.Tensor] = None,
+    state_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -147,6 +164,7 @@ def gated_delta_rule_decode_pretranspose(
     state : torch.Tensor, optional
         Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
         Float32: legacy kernel (T=1 only).  Bfloat16: BF16 state backend
+        (T=1 or MTP for T>1) when K=V=128.  Float16: FP16 state backend
         (T=1 or MTP for T>1) when K=V=128.  Updated in-place.  Pass ``None``
         when using ``initial_state`` / ``initial_state_indices`` instead.
     A_log : torch.Tensor
@@ -308,6 +326,9 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
             )
         else:
             # MTP kernel for T>1 (supports pool+indices and intermediate caching)
@@ -327,6 +348,9 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
             )
         if forward_output is not None:
             # Kernel wrote directly into the user's buffer.
@@ -335,6 +359,144 @@ def gated_delta_rule_decode_pretranspose(
             output = out
         else:
             # User wants a non-bf16 dtype; cast on the way back.
+            output.copy_(out.to(target_dtype))
+        return_state = initial_state if use_pool else state
+        return output, return_state
+
+    # Backend: FP16 state kernel when fp16 state, K=V=128
+    use_fp16_state = (
+        _GDN_DECODE_FP16_STATE_AVAILABLE
+        and state_dtype == torch.float16
+        and K == 128
+        and V == 128
+    )
+    if use_fp16_state:
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            f"q must be float16/bfloat16, got {q.dtype}"
+        )
+        assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+        scale_val = K**-0.5 if scale is None else scale
+        if use_pool:
+            fp16_pool = initial_state
+            fp16_indices = initial_state_indices
+        else:
+            fp16_pool = state
+            fp16_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+        target_dtype = output.dtype if output is not None else q.dtype
+        forward_output = (
+            output if (output is not None and output.dtype == torch.float16) else None
+        )
+        if T == 1:
+            out = _gated_delta_rule_fp16_state(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=fp16_pool,
+                initial_state_indices=fp16_indices,
+                output_state_indices=output_state_indices,
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale_val,
+                output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
+            )
+        else:
+            out = _gated_delta_rule_fp16_state_mtp(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=fp16_pool,
+                initial_state_indices=fp16_indices,
+                output_state_indices=output_state_indices,
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale_val,
+                output=forward_output,
+                use_sr=use_sr,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
+            )
+        if forward_output is not None:
+            output = forward_output
+        elif output is None:
+            output = out
+        else:
+            output.copy_(out.to(target_dtype))
+        return_state = initial_state if use_pool else state
+        return output, return_state
+
+    # Backend: FP8 (E4M3) state kernel when fp8 state, K=V=128. Shares the
+    # bf16/fp16 kernel (IS_FP8 derived from the pool dtype); requires a
+    # per-row scale pool (state_scale, [pool, HV, V] fp32).
+    use_fp8_state = (
+        _GDN_DECODE_FP16_STATE_AVAILABLE
+        and state_dtype == torch.float8_e4m3fn
+        and K == 128
+        and V == 128
+    )
+    if use_fp8_state:
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            f"q must be float16/bfloat16, got {q.dtype}"
+        )
+        assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+        assert state_scale is not None, (
+            "fp8 GDN state requires state_scale (the [pool, HV, V] fp32 scale pool)"
+        )
+        scale_val = K**-0.5 if scale is None else scale
+        if use_pool:
+            fp8_pool = initial_state
+            fp8_indices = initial_state_indices
+        else:
+            fp8_pool = state
+            fp8_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+        # Output is the attention output in the IO dtype (bf16/fp16), not fp8.
+        forward_output = (
+            output if (output is not None and output.dtype == q.dtype) else None
+        )
+        target_dtype = output.dtype if output is not None else q.dtype
+        kern = (
+            _gated_delta_rule_fp16_state
+            if T == 1
+            else _gated_delta_rule_fp16_state_mtp
+        )
+        out = kern(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=fp8_pool,
+            initial_state_indices=fp8_indices,
+            output_state_indices=output_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            scale=scale_val,
+            output=forward_output,
+            use_sr=use_sr,
+            philox_rounds=philox_rounds,
+            rand_seed=rand_seed,
+            state_scale=state_scale,
+        )
+        if forward_output is not None:
+            output = forward_output
+        elif output is None:
+            output = out
+        else:
             output.copy_(out.to(target_dtype))
         return_state = initial_state if use_pool else state
         return output, return_state
